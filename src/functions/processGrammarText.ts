@@ -1,14 +1,50 @@
+// src/helpers/processGrammarText.ts
 import grammarPrompt from "../guide/grammarPrompt.js";
 import { levelInstructions } from "../guide/levelInstruction.js";
 import { checkRateLimit } from "./rateLimit.js";
 import validateInput from "./validateInput.js";
 import { callGeminiGenerateContent } from "../api/gemini/callGeminiGenerateContents.js";
 import formatResponse from "./formatResponse.js";
-import Conversation from "../models/conversation.js";  
+import Conversation from "../models/conversation.js";
 import { Context } from "telegraf";
 
-// Function to process grammar text
-async function processGrammarText(ctx: Context, userText:string, userId:number) {
+// Define AI response type
+interface AIResponse {
+  correctedText: string;
+  explanation: string;
+  grammarType: string;
+}
+
+/**
+ * Convert AI markdown-like formatting into Telegram HTML parse_mode
+ */
+function formatForTelegram(text: string): string {
+  return text
+    .replace(/~~([^~]+)~~/g, "<s>$1</s>")     // strikethrough
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>") // bold
+    .replace(/\*([^*]+)\*/g, "<i>$1</i>")     // italic
+    .replace(/__([^_]+)__/g, "<u>$1</u>")     // underline
+    .replace(/`([^`]+)`/g, "<code>$1</code>"); // inline code
+}
+
+/**
+ * Clean AI response by removing ```json blocks
+ */
+function cleanAIResponse(raw: string): string {
+  return raw.trim()
+            .replace(/^```json\s*/, "")
+            .replace(/```$/, "")
+            .trim();
+}
+
+/**
+ * Handles user grammar correction requests
+ */
+async function processGrammarText(
+  ctx: Context,
+  userText: string,
+  userId: number
+) {
   await ctx.sendChatAction("typing");
 
   // Validate input
@@ -18,7 +54,7 @@ async function processGrammarText(ctx: Context, userText:string, userId:number) 
     return;
   }
 
-  // Check rate limit
+  // Rate limit check
   if (!checkRateLimit(userId)) {
     await ctx.reply(
       formatResponse(
@@ -30,40 +66,55 @@ async function processGrammarText(ctx: Context, userText:string, userId:number) 
   }
 
   try {
-    // Retrieve the user's conversation
+    // Retrieve conversation
     let conversation = await Conversation.findOne({ userId });
     if (!conversation) {
       conversation = await Conversation.create({ userId });
     }
 
-    // Extract user info from previous grammar messages if any
+    // Extract user info if they introduced themselves earlier
     let userInfo = "";
     if (conversation.grammar.length > 0) {
       const namePatterns = conversation.grammar
-        .filter(conv => conv.input.toLowerCase().includes("my name is") || conv.input.toLowerCase().includes("i am"))
-        .map(conv => conv.input);
+        .filter(
+          (conv: any) =>
+            conv.input.toLowerCase().includes("my name is") ||
+            conv.input.toLowerCase().includes("i am")
+        )
+        .map((conv: any) => conv.input);
 
       if (namePatterns.length > 0) {
         const lastNameIntro = namePatterns[namePatterns.length - 1];
-        const nameMatch = lastNameIntro.match(/(?:my name is|i am)\s+([a-zA-Z]+)/i);
+        const nameMatch = lastNameIntro.match(
+          /(?:my name is|i am)\s+([a-zA-Z]+)/i
+        );
         if (nameMatch) userInfo = `User's name: ${nameMatch[1]}. `;
       }
     }
 
-    // Get user level
+    // User level (default beginner)
     const userLevel = conversation.userLevel || "beginner";
 
-    // Use last 10 grammar messages for context
-    const contextText = conversation.grammar.length > 0
-      ? `=== GRAMMAR HISTORY (READ CAREFULLY) ===
+    // Conversation context (last 10 grammar messages)
+    const contextText =
+      conversation.grammar.length > 0
+        ? `=== GRAMMAR HISTORY (READ CAREFULLY) ===
 ${userInfo}Recent grammar messages:
-${conversation.grammar.slice(-10).map((c, i) => `${i + 1}. User: "${c.input}" → Bot: "${c.response}"`).join("\n")}
+${conversation.grammar
+  .slice(-10)
+  .map(
+    (c: any, i: number) =>
+      `${i + 1}. User: "${c.input}" → Bot: "${c.response}"`
+  )
+  .join("\n")}
 Current context: The user is learning about "Grammar Correction".
 User Level: ${userLevel.toUpperCase()}
 === END GRAMMAR HISTORY ===`
-      : userInfo ? `CONTEXT: ${userInfo}` : "";
+        : userInfo
+        ? `CONTEXT: ${userInfo}`
+        : "";
 
-    // Build prompt for AI
+    // Build prompt
     const prmt = `${grammarPrompt}
 ${levelInstructions[userLevel]}
 
@@ -71,27 +122,49 @@ ${contextText}
 
 User text: "${userText}"`;
 
-    const aiText = await callGeminiGenerateContent(prmt);
+    // Call AI
+    const aiTextRaw = await callGeminiGenerateContent(prmt);
+    console.log("AI Response:", aiTextRaw);
 
-    // Convert markdown to HTML for Telegram
-    const formattedText = aiText
-      .replace(/~~([^~]+)~~/g, "<s>$1</s>")
-      .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+    // Clean and parse AI response
+    const cleanedText = cleanAIResponse(aiTextRaw);
+    let aiJson: AIResponse;
+    try {
+      aiJson = JSON.parse(cleanedText) as AIResponse;
+    } catch (err) {
+      console.error("Invalid AI JSON:", err, cleanedText);
+      await ctx.reply(
+        formatResponse("❌ Invalid AI response. Please try again.", "error")
+      );
+      return;
+    }
 
-    // Update conversation in DB
+    // Format AI response for Telegram
+    const formattedText = `
+<b>${formatForTelegram(aiJson.correctedText)}</b>
+Explanation: ${formatForTelegram(aiJson.explanation)}
+`.trim();
+
+    // Save conversation update
     await Conversation.findOneAndUpdate(
       { userId },
       {
-        $set: { currentLesson: "Grammar Correction", lastActive: new Date() },
-        $push: { grammar: { input: userText, response: formattedText } },
+        $set: {
+          currentLesson: "Grammar Correction",
+          lastActive: new Date(),
+        },
+        $push: {
+          grammar: { input: userText, response: formattedText, grammarType: aiJson.grammarType },
+        },
       },
       { new: true, upsert: true }
     );
 
+    // Reply to user
     await ctx.reply(formattedText, { parse_mode: "HTML" });
-  } catch (err:any) {
+  } catch (err: any) {
     console.error("Bot error:", err);
-    const errorMessage = err.message.includes("API")
+    const errorMessage = err.message?.includes("API")
       ? "I'm having trouble connecting to my AI service right now. Please try again in a few minutes."
       : "Something went wrong while processing your request. Please try again.";
     await ctx.reply(formatResponse(errorMessage, "error"));
