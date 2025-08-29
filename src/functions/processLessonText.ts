@@ -93,12 +93,8 @@ User text: "${userText}"
       },
       { new: true, upsert: true }
     );
-
-    // Send lesson to user
-    await ctx.reply(
-      `${formattedLesson}\n\n<b>Practice:</b>\nImagine you see your neighbor, Mrs. Lee, at 3:00 PM. What should you say to her?`,
-      { parse_mode: "HTML" }
-    );
+    await ctx.reply(formattedLesson, { parse_mode: "HTML" });
+ 
   } catch (err: any) {
     console.error("Error generating lesson:", err);
     const errorMessage = err.message.includes("API")
