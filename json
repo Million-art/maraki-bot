@@ -6,6 +6,7 @@
   "author": "",
   "type": "module",
   
+  
   "main": "bot.ts",
   "scripts": {
     "start": "node bot.ts",
